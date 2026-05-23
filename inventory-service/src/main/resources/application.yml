@@ -1,0 +1,32 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: inventory-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/inventory_db?useSSL=false&serverTimezone=Asia/Seoul&allowPublicKeyRetrieval=true
+    username: commerce
+    password: commerce1234
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      # inventory-group: order-events 토픽을 소비하는 재고 서비스 전용 consumer group.
+      # notification-service의 notification-group과 다른 group-id를 사용하기 때문에
+      # 두 서비스가 동일한 파티션의 동일한 메시지를 각각 독립적으로 수신한다.
+      group-id: inventory-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.commerce.*"
+        spring.json.value.default.type: com.commerce.inventory.infrastructure.kafka.OrderCreatedEvent
+
+logging:
+  level:
+    com.commerce: DEBUG

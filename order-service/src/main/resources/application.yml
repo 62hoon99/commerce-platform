@@ -1,0 +1,36 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: order-service
+  datasource:
+    url: jdbc:mysql://localhost:3306/order_db?useSSL=false&serverTimezone=Asia/Seoul&allowPublicKeyRetrieval=true
+    username: commerce
+    password: commerce1234
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # acks=1: 리더 파티션이 메시지를 받으면 즉시 응답 — 성능과 안정성의 균형점
+      # acks=all은 더 안전하지만 레이턴시가 증가한다
+      acks: "1"
+      properties:
+        spring.json.add.type.headers: false
+
+kafka:
+  topic:
+    order-events: order-events
+
+logging:
+  level:
+    com.commerce: DEBUG

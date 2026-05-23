@@ -1,0 +1,24 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: notification-service
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      # notification-group: inventory-group과 다른 consumer group이므로
+      # 두 서비스는 동일한 order-events 토픽 메시지를 각자 독립적으로 수신한다.
+      # Kafka는 consumer group 단위로 offset을 관리하기 때문에
+      # group-id가 다르면 완전히 별개의 소비자로 취급된다.
+      group-id: notification-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.commerce.*"
+        spring.json.value.default.type: com.commerce.notification.infrastructure.kafka.OrderCreatedEvent
+
+logging:
+  level:
+    com.commerce: DEBUG

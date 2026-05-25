@@ -85,6 +85,163 @@ OutboxEventPoller (5초마다)
 
 ---
 
+## 2단계: Redis 실시간 랭킹 + Circuit Breaker
+
+### 왜 MySQL이 아니라 Redis인가?
+
+랭킹을 MySQL로 집계하면 상품을 조회할 때마다 `UPDATE products SET view_count = view_count + 1`이 발생한다.  
+대규모 세일처럼 초당 수천 건의 조회가 발생하면 이 UPDATE가 row-level lock을 유발해 쿼리 경합으로 이어진다.
+
+Redis Sorted Set은 이 문제를 두 가지 방식으로 해결한다.
+
+| 비교 항목 | MySQL | Redis Sorted Set |
+|-----------|-------|-----------------|
+| 조회수 증가 | `UPDATE` + row lock | `ZINCRBY` 단일 원자 명령 |
+| 랭킹 정렬 | `ORDER BY view_count DESC` (풀스캔 또는 인덱스) | Skip List 기반 O(log N) |
+| 저장소 | 디스크 I/O 포함 | 인메모리 |
+| 동시성 처리 | 낙관적/비관적 락 | 단일 스레드 이벤트 루프 (락 불필요) |
+
+랭킹은 "영구적으로 정확한 기록"보다 "빠른 실시간 반영"이 중요한 케이스다.  
+Redis는 이 트레이드오프에서 명확한 우위에 있다.
+
+---
+
+### Sorted Set(ZSet)을 선택한 이유
+
+Redis의 여러 자료구조 중 Sorted Set을 선택한 이유:
+
+- **String**: 단순 카운터는 가능하지만 여러 상품을 정렬해서 가져올 수 없다.
+- **List**: 삽입 순서 유지는 되지만 score 기반 정렬이 없다.
+- **Sorted Set**: `(member, score)` 쌍으로 저장하고 score 기준 정렬을 자동으로 유지한다.
+  - `ZINCRBY key 1 productId` → 조회수 1 증가 + 순위 자동 갱신
+  - `ZREVRANGE key 0 9 WITHSCORES` → score 내림차순 TOP 10 조회
+
+---
+
+### ZINCRBY 원자성과 동시성
+
+Redis는 단일 스레드 이벤트 루프로 모든 명령을 순차 처리한다.  
+`ZINCRBY`는 "읽기 → 증가 → 쓰기"가 하나의 원자적 명령으로 실행된다.
+
+```
+[서버 A] ZINCRBY ranking:daily:20260525 1 "productId:1"
+[서버 B] ZINCRBY ranking:daily:20260525 1 "productId:1"
+                          ↓
+          Redis 이벤트 루프: A 실행 → B 실행 (순차, 끼어들 수 없음)
+          결과: score = 2 (정확)
+```
+
+MySQL의 `UPDATE ... SET view_count = view_count + 1`은 두 트랜잭션이 동시에 같은 값을 읽으면  
+둘 다 같은 값으로 +1하는 Lost Update가 발생할 수 있다.  
+Redis는 구조적으로 이 문제가 없다.
+
+---
+
+### 랭킹 키 날짜 전략과 TTL
+
+```
+ranking:daily          (고정 키)
+ranking:daily:20260525 (날짜 포함 키) ← 채택
+```
+
+**고정 키의 문제**: TTL이 키 생성 시점부터 카운트되므로 "자정 리셋"이 보장되지 않는다.  
+오전 6시에 키가 만들어지면 24시간 TTL 기준으로 다음날 오전 6시에 만료된다. 날짜가 어긋난다.
+
+**날짜 포함 키**: 날짜가 바뀌면 자연스럽게 새 키를 사용하므로 일별 랭킹이 독립적으로 쌓인다.  
+TTL 48시간은 자정 전후 경계에서 키가 사라지는 것을 막고, 당일 오전에 전날 랭킹도 참조 가능하게 한다.  
+무한정 누적을 막는 Redis 메모리 자동 정리 역할도 한다.
+
+TTL 설정은 키가 처음 생성될 때(`getExpire == -1`)만 한다. 매 조회마다 호출하면 TTL이 계속 리셋된다.
+
+---
+
+### Circuit Breaker 도입 이유
+
+퀸잇의 럭퀸세일처럼 대규모 트래픽이 몰릴 때 Redis 응답이 지연되거나 다운되면 다음 흐름으로 전체 장애가 발생한다.
+
+```
+Redis 응답 지연
+  → 랭킹 API 스레드가 타임아웃까지 블로킹
+  → 스레드 풀 소진
+  → 다른 정상 API도 처리 불가
+  → 서비스 전체 다운  ← Cascading Failure
+```
+
+Circuit Breaker는 이 전파를 차단한다.
+
+```
+Redis 응답 지연
+  → Circuit Breaker: OPEN 상태 진입
+  → 이후 요청은 Redis에 가지 않고 즉시 fallback(빈 리스트) 반환
+  → 스레드 블로킹 없음 → 나머지 API 정상 동작 유지
+```
+
+랭킹이 잠깐 안 보이는 것은 감수할 수 있는 손실이지만, 전체 서비스 다운은 허용할 수 없다.  
+Circuit Breaker는 이 트레이드오프를 명시적으로 선택하는 패턴이다.
+
+---
+
+### Circuit Breaker 세 가지 상태
+
+```
+                 실패율 >= 50%
+   CLOSED ──────────────────────→ OPEN
+     ↑                              │
+     │ 테스트 성공                  │ 10초 경과
+     │                              ↓
+     └─────────────────────── HALF_OPEN
+                                    │
+                              테스트 실패
+                                    │
+                                   OPEN (재진입)
+```
+
+| 상태 | 동작 | 전환 조건 |
+|------|------|-----------|
+| **CLOSED** | 모든 요청을 Redis로 통과. 실패율 측정 중 | 실패율 ≥ 50% (10번 중 5번 이상 실패) |
+| **OPEN** | 모든 요청을 즉시 차단. Redis에 연결 안 함. fallback 반환 | 10초 경과 후 HALF_OPEN |
+| **HALF_OPEN** | 소수(3번)의 테스트 요청만 허용해 복구 여부 확인 | 성공 → CLOSED / 실패 → OPEN |
+
+---
+
+### 로컬 테스트 방법
+
+#### 정상 흐름
+
+```bash
+# product-service 실행 (포트 8083)
+./gradlew :product-service:bootRun
+
+# 상품별 다른 횟수로 조회 (조회 = Redis score 증가)
+for i in {1..5}; do curl -s http://localhost:8083/api/products/1 > /dev/null; done
+for i in {1..3}; do curl -s http://localhost:8083/api/products/2 > /dev/null; done
+for i in {1..7}; do curl -s http://localhost:8083/api/products/3 > /dev/null; done
+
+# TOP 10 랭킹 조회
+curl http://localhost:8083/api/products/ranking
+
+# redis-cli로 직접 확인
+docker exec commerce-redis redis-cli ZREVRANGE ranking:daily:$(date +%Y%m%d) 0 -1 WITHSCORES
+docker exec commerce-redis redis-cli TTL ranking:daily:$(date +%Y%m%d)
+```
+
+#### Circuit Breaker 확인
+
+```bash
+# 1. Redis 중지
+docker stop commerce-redis
+
+# 2. 랭킹 API 반복 호출 → 실패 후 fallback(빈 배열) 반환, 회로 OPEN 전환 확인
+for i in {1..10}; do curl -s http://localhost:8083/api/products/ranking; echo ""; done
+
+# 3. Redis 재시작 (10초 경과 후 HALF_OPEN → CLOSED 복구)
+docker start commerce-redis
+sleep 12
+curl http://localhost:8083/api/products/ranking  # 정상 랭킹 반환
+```
+
+---
+
 ## 프로젝트 구조
 
 ```
@@ -107,11 +264,20 @@ commerce-platform/
 │       ├── OrderEventConsumer.java
 │       ├── KafkaConsumerConfig.java   # DLQ ErrorHandler
 │       └── DeadLetterConsumer.java    # DLT 소비자
-└── notification-service/     (port: 8082)
-    └── infrastructure/kafka/
-        ├── OrderEventConsumer.java
-        ├── KafkaConsumerConfig.java
-        └── DeadLetterConsumer.java
+├── notification-service/     (port: 8082)
+│   └── infrastructure/kafka/
+│       ├── OrderEventConsumer.java
+│       ├── KafkaConsumerConfig.java
+│       └── DeadLetterConsumer.java
+└── product-service/          (port: 8083)
+    ├── domain/Product.java, ProductRepository.java
+    ├── application/
+    │   ├── ProductService.java        # 상품 조회 + 랭킹 score 증가 연계
+    │   └── RankingService.java        # Redis Sorted Set 랭킹 + Circuit Breaker
+    ├── infrastructure/redis/
+    │   └── RedisConfig.java           # RedisTemplate<String, String>
+    └── resources/
+        └── data.sql                   # 더미 상품 15개
 ```
 
 ---
@@ -135,10 +301,11 @@ docker-compose up -d
 ### 2. 서비스 실행
 
 ```bash
-# 별도 터미널 3개에서 각각 실행
-./gradlew :order-service:bootRun
-./gradlew :inventory-service:bootRun
-./gradlew :notification-service:bootRun
+# 별도 터미널에서 각각 실행
+./gradlew :order-service:bootRun        # 1단계 주문 서비스
+./gradlew :inventory-service:bootRun    # 1단계 재고 소비자
+./gradlew :notification-service:bootRun # 1단계 알림 소비자
+./gradlew :product-service:bootRun      # 2단계 상품 랭킹 서비스
 ```
 
 ### 3. 주문 생성
@@ -164,7 +331,8 @@ curl -X POST http://localhost:8080/api/orders \
 ## 로드맵
 
 - [x] **1단계**: Kafka 이벤트 기반 파이프라인 + Outbox Pattern + Dead Letter Queue
-- [ ] **2단계**: Redis — 실시간 인기 상품 랭킹 (Sorted Set), 분산락 (Redisson), Circuit Breaker
+- [x] **2단계**: Redis — 실시간 인기 상품 랭킹 (Sorted Set) + Circuit Breaker (Resilience4j)
+- [ ] **2단계 예정**: Redisson 분산락으로 주문 동시성 제어
 - [ ] **3단계**: Elasticsearch — 상품 검색 (MySQL LIKE → BM25)
 
 ---

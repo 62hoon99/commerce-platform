@@ -1,7 +1,8 @@
 package com.commerce.order.api;
 
-import com.commerce.order.application.OrderService;
+import com.commerce.order.application.OrderFacade;
 import com.commerce.order.domain.Order;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -15,16 +16,21 @@ import java.time.LocalDateTime;
 @RequestMapping("/api/orders")
 public class OrderController {
 
-    private final OrderService orderService;
+    private final OrderFacade orderFacade;
 
-    public OrderController(OrderService orderService) {
-        this.orderService = orderService;
+    public OrderController(OrderFacade orderFacade) {
+        this.orderFacade = orderFacade;
     }
 
     @PostMapping
-    public ResponseEntity<OrderResponse> createOrder(@RequestBody CreateOrderRequest request) {
-        Order order = orderService.createOrder(request.userId(), request.totalAmount());
-        return ResponseEntity.ok(OrderResponse.from(order));
+    public ResponseEntity<?> createOrder(@RequestBody CreateOrderRequest request) {
+        try {
+            Order order = orderFacade.createOrder(request.userId(), request.totalAmount());
+            return ResponseEntity.ok(OrderResponse.from(order));
+        } catch (OrderFacade.ConcurrentOrderException e) {
+            // 동일 사용자 동시 주문 감지 → 409 Conflict
+            return ResponseEntity.status(HttpStatus.CONFLICT).body(e.getMessage());
+        }
     }
 
     public record CreateOrderRequest(String userId, BigDecimal totalAmount) {}

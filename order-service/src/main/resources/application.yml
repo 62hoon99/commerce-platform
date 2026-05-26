@@ -27,6 +27,11 @@ spring:
       properties:
         spring.json.add.type.headers: false
 
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
 kafka:
   topic:
     order-events: order-events
